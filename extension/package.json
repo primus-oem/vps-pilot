@@ -1,0 +1,45 @@
+{
+  "name": "vps-pilot",
+  "displayName": "VPS Pilot",
+  "description": "Local MCP integration for VPS Pilot",
+  "version": "0.1.0",
+  "publisher": "vps-pilot-dev",
+  "engines": {
+    "vscode": "^1.110.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onMcpServerDefinitionProvider:vps-pilot.mcp"
+  ],
+  "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "vps-pilot.mcp",
+        "label": "VPS Pilot"
+      }
+    ],
+    "configuration": {
+      "title": "VPS Pilot",
+      "properties": {
+        "vpsPilot.binaryPath": {
+          "type": "string",
+          "default": "vps-pilot",
+          "description": "Path or executable name for the local VPS Pilot core."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "tsc -p tsconfig.test.json && node --test .test-out/tests/serverConfiguration.test.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/vscode": "^1.146.0",
+    "typescript": "^5.9.3"
+  }
+}

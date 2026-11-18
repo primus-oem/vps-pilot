@@ -1,0 +1,13 @@
+/dist/
+
+/docs/
+/core/package-lock.json
+/core/vps-pilot
+/core/state.db
+/core/state.db-shm
+/core/state.db-wal
+/.nvmrc
+/extension/node_modules/
+/extension/out/
+/extension/.test-out/
+/extension/*.vsix
