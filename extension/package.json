@@ -3,7 +3,7 @@
   "displayName": "VPS Pilot",
   "description": "Local MCP integration for VPS Pilot",
   "version": "0.1.0",
-  "publisher": "vps-pilot-dev",
+  "publisher": "Petru Reaboi",
   "engines": {
     "vscode": "^1.110.0"
   },

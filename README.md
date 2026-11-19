@@ -11,14 +11,20 @@ The repository currently contains an early development scaffold:
 - The Go CLI provides `version` and starts an MCP stdio server with `mcp`.
 - The MCP server exposes `get_policy_capabilities`. Mutating operations are disabled.
 - SQLite local state is initialized with a versioned schema and restricted file permissions.
+- SQLite uses the pure-Go `modernc.org/sqlite` driver, so Core builds do not require a C compiler or CGO.
+- A strict SSH/SFTP connection manager foundation supports private keys, `ssh-agent`, pinned `known_hosts`, deadlines and connection reuse.
+- SSH hosts persist in SQLite and can be managed through `vps-pilot host list|add|test`.
+- MCP exposes `hosts_list` and `host_connection_test`; mutations remain disabled.
+- Read-only `get_host_health` runs fixed uname/disk/systemd/Docker/Compose operations with output limits and secret/control-character sanitization.
+- Strict local YAML application manifests support cycle-safe dependency graphs and Compose mappings.
+- CLI `app validate|import|list|graph` and read-only MCP `apps_list|app_graph` provide imported application metadata.
 - The VS Code extension registers the configured local executable as an MCP server.
 
-SSH host management, Compose import and deployment, secret intake, approvals, monitoring, and recovery are not implemented. Do not use this version to manage production infrastructure.
+SSH host management, Compose import and deployment, secret intake, approvals, monitoring, and recovery are not yet complete. The SSH package is infrastructure only and is not exposed as a generic shell or unrestricted command interface. Do not use this version to manage production infrastructure.
 
 ## Requirements
 
 - Go 1.25 or newer
-- A C compiler for the SQLite driver
 - Node.js 20 or newer and npm
 
 ## Build and Test

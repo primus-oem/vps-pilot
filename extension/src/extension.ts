@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { createServerConfiguration } from './serverConfiguration';
+import { createServerConfiguration, validateServerBinary } from './serverConfiguration';
 
 export function activate(context: vscode.ExtensionContext): void {
   const definitionsChanged = new vscode.EventEmitter<void>();
@@ -14,6 +14,11 @@ export function activate(context: vscode.ExtensionContext): void {
     provideMcpServerDefinitions: () => {
       const binaryPath = vscode.workspace.getConfiguration('vpsPilot').get<string>('binaryPath');
       const configuration = createServerConfiguration(binaryPath);
+      const validationError = validateServerBinary(configuration.command);
+      if (validationError) {
+        void vscode.window.showErrorMessage(`VPS Pilot core could not start: ${validationError}`);
+        return [];
+      }
       return [new vscode.McpStdioServerDefinition(
         configuration.label,
         configuration.command,
