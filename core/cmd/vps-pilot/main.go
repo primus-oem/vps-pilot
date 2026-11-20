@@ -161,6 +161,26 @@ func runAppCommand(ctx context.Context, args []string) error {
 	defer store.Close()
 
 	switch args[0] {
+	case "plan":
+		if len(args) != 4 {
+			return fmt.Errorf("usage: vps-pilot app plan <application-id> <environment> <service,service>")
+		}
+		app, err := store.GetApplication(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		var manifest application.Manifest
+		if err := json.Unmarshal([]byte(app.Manifest), &manifest); err != nil {
+			return err
+		}
+		services := strings.Split(args[3], ",")
+		plan, err := application.CreateReleasePlan(&manifest, args[2], services)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(plan)
 	case "validate":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: vps-pilot app validate <manifest.yaml>")

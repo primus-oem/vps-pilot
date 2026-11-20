@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	_ "modernc.org/sqlite"
 )
@@ -46,6 +48,10 @@ func OpenDefault(ctx context.Context) (*Store, error) {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve state database path: %w", err)
+	}
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
@@ -57,8 +63,16 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	} else if !info.IsDir() {
 		return nil, errors.New("state directory must be a directory")
 	}
-	if err := os.Chmod(directory, 0700); err != nil {
-		return nil, fmt.Errorf("restrict state directory permissions: %w", err)
+	resolvedDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		return nil, fmt.Errorf("resolve state directory: %w", err)
+	}
+	directory = resolvedDirectory
+	path = filepath.Join(directory, filepath.Base(path))
+	if info, err := os.Stat(directory); err != nil {
+		return nil, fmt.Errorf("inspect resolved state directory: %w", err)
+	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
+		return nil, fmt.Errorf("state directory permissions %04o are too broad; restrict to 0700", info.Mode().Perm())
 	}
 
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -81,7 +95,12 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("close state database file: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", path)
+	dsnPath := filepath.ToSlash(path)
+	if runtime.GOOS == "windows" && len(dsnPath) >= 2 && dsnPath[1] == ':' {
+		dsnPath = "/" + dsnPath
+	}
+	dsn := (&url.URL{Scheme: "file", Path: dsnPath}).String() + "?mode=rw"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open state database: %w", err)
 	}

@@ -18,6 +18,7 @@ The repository currently contains an early development scaffold:
 - Read-only `get_host_health` runs fixed uname/disk/systemd/Docker/Compose operations with output limits and secret/control-character sanitization.
 - Strict local YAML application manifests support cycle-safe dependency graphs and Compose mappings.
 - CLI `app validate|import|list|graph` and read-only MCP `apps_list|app_graph` provide imported application metadata.
+- CLI `app plan` and MCP `plan_application_release` produce environment-scoped plans with immutable image digests, explicit host/path mappings, registry allowlists and a verifiable SHA-256 digest. Planning does not execute changes.
 - The VS Code extension registers the configured local executable as an MCP server.
 
 SSH host management, Compose import and deployment, secret intake, approvals, monitoring, and recovery are not yet complete. The SSH package is infrastructure only and is not exposed as a generic shell or unrestricted command interface. Do not use this version to manage production infrastructure.

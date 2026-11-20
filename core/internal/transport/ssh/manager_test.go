@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -100,22 +101,24 @@ func TestManagerConnectsToDisposableSSHServer(t *testing.T) {
 	}
 	defer listener.Close()
 	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		sshConn, channels, requests, err := ssh.NewServerConn(conn, serverConfig)
-		if err != nil {
-			_ = conn.Close()
-			return
-		}
-		go ssh.DiscardRequests(requests)
-		go func() {
-			for channel := range channels {
-				_ = channel.Reject(ssh.UnknownChannelType, "unsupported")
+		for i := 0; i < 2; i++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
 			}
-		}()
-		_ = sshConn.Wait()
+			sshConn, channels, requests, err := ssh.NewServerConn(conn, serverConfig)
+			if err != nil {
+				_ = conn.Close()
+				return
+			}
+			go ssh.DiscardRequests(requests)
+			go func() {
+				for channel := range channels {
+					_ = channel.Reject(ssh.UnknownChannelType, "unsupported")
+				}
+			}()
+			_ = sshConn.Wait()
+		}
 	}()
 
 	_, identityPrivate, err := ed25519.GenerateKey(rand.Reader)
@@ -142,14 +145,98 @@ func TestManagerConnectsToDisposableSSHServer(t *testing.T) {
 
 	manager := NewManager()
 	defer manager.Close()
-	client, err := manager.Connect(t.Context(), Config{
+	cfg := Config{
 		Alias: "fixture", Host: "127.0.0.1", User: "deploy", Port: hostPort.Port,
-		IdentityFiles: []string{identityPath}, KnownHostsFile: knownHostsPath,
-	})
+		IdentityFiles: []string{identityPath}, KnownHostsFile: knownHostsPath, Timeout: time.Second,
+	}
+	client, err := manager.Connect(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if client == nil {
 		t.Fatal("expected SSH client")
+	}
+	reused, err := manager.Connect(t.Context(), cfg)
+	if err != nil || reused != client {
+		t.Fatalf("expected live connection reuse, client=%p err=%v", reused, err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reconnected, err := manager.Connect(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconnected == client {
+		t.Fatal("returned closed SSH connection")
+	}
+}
+
+func TestManagerRejectsChangedHostKey(t *testing.T) {
+	_, hostPrivateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wrongPrivateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSigner, err := ssh.NewSignerFromKey(wrongPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig := &ssh.ServerConfig{PublicKeyCallback: func(_ ssh.ConnMetadata, _ ssh.PublicKey) (*ssh.Permissions, error) {
+		return &ssh.Permissions{}, nil
+	}}
+	serverConfig.AddHostKey(hostSigner)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		serverConn, _, requests, err := ssh.NewServerConn(conn, serverConfig)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		go ssh.DiscardRequests(requests)
+		_ = serverConn.Wait()
+	}()
+	_, identityPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	identityDER, err := x509.MarshalPKCS8PrivateKey(identityPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityPath := filepath.Join(root, "identity")
+	if err := os.WriteFile(identityPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: identityDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	hostPort := listener.Addr().(*net.TCPAddr)
+	knownHostsPath := filepath.Join(root, "known_hosts")
+	line := knownhosts.Line([]string{fmt.Sprintf("[%s]:%d", hostPort.IP, hostPort.Port)}, wrongSigner.PublicKey())
+	if err := os.WriteFile(knownHostsPath, []byte(line+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager()
+	defer manager.Close()
+	_, err = manager.Connect(t.Context(), Config{
+		Alias: "changed", Host: "127.0.0.1", User: "deploy", Port: hostPort.Port,
+		IdentityFiles: []string{identityPath}, KnownHostsFile: knownHostsPath, Timeout: time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected changed SSH host key to be rejected")
 	}
 }

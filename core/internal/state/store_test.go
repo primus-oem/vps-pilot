@@ -15,17 +15,23 @@ func TestOpenRejectsSymlinkDatabase(t *testing.T) {
 	if err := os.WriteFile(target, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(root, "state.db")
-	if err := os.Symlink(target, link); err != nil {
+	privateLink := filepath.Join(root, "private", "state.db")
+	if err := os.Mkdir(filepath.Dir(privateLink), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, privateLink); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, err := Open(context.Background(), link); err == nil {
+	if _, err := Open(context.Background(), privateLink); err == nil {
 		t.Fatal("expected symlink database to be rejected")
 	}
 }
 
 func TestOpenRejectsDirectoryDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
+	path := filepath.Join(t.TempDir(), "private", "state.db")
+	if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(path, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -34,8 +40,29 @@ func TestOpenRejectsDirectoryDatabase(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsSharedStateDirectoryWithoutChangingPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory permission bits do not represent ACLs")
+	}
+	directory := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(directory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "state.db")
+	if _, err := Open(context.Background(), path); err == nil {
+		t.Fatal("expected shared directory to be rejected")
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0755 {
+		t.Fatalf("Open changed directory permissions to %04o", info.Mode().Perm())
+	}
+}
+
 func TestHostPersistence(t *testing.T) {
-	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "private", "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +81,7 @@ func TestHostPersistence(t *testing.T) {
 }
 
 func TestApplicationPersistence(t *testing.T) {
-	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "private", "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

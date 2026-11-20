@@ -2,6 +2,8 @@ package ssh
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -99,27 +101,43 @@ func (m *Manager) Connect(ctx context.Context, cfg Config) (*ssh.Client, error) 
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
-
-	m.mu.Lock()
-	if client := m.clients[cfg.Alias]; client != nil {
-		m.mu.Unlock()
-		return client, nil
-	}
-	m.mu.Unlock()
-
-	auth, err := authMethods(cfg.IdentityFiles)
+	key, err := connectionKey(cfg)
 	if err != nil {
 		return nil, err
 	}
+
+	m.mu.Lock()
+	cached := m.clients[key]
+	m.mu.Unlock()
+	if cached != nil {
+		pingCtx, cancel := context.WithTimeout(ctx, cfgTimeout(cfg))
+		alive, err := clientAlive(pingCtx, cached)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		if alive {
+			return cached, nil
+		}
+		m.mu.Lock()
+		if m.clients[key] == cached {
+			delete(m.clients, key)
+		}
+		m.mu.Unlock()
+		_ = cached.Close()
+	}
+
+	auth, closeAuth, err := authMethodsWithCleanup(cfg.IdentityFiles)
+	if err != nil {
+		return nil, err
+	}
+	defer closeAuth()
 	callback, err := knownhosts.New(expandPath(cfg.KnownHostsFile))
 	if err != nil {
 		return nil, fmt.Errorf("load known_hosts: %w", err)
 	}
 
-	timeout := cfg.Timeout
-	if timeout == 0 {
-		timeout = 10 * time.Second
-	}
+	timeout := cfgTimeout(cfg)
 	dialer := &net.Dialer{Timeout: timeout}
 	address := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	conn, err := dialer.DialContext(ctx, "tcp", address)
@@ -127,10 +145,13 @@ func (m *Manager) Connect(ctx context.Context, cfg Config) (*ssh.Client, error) 
 		return nil, fmt.Errorf("dial SSH host %q: %w", cfg.Alias, err)
 	}
 
-	deadline, ok := ctx.Deadline()
-	if ok {
-		_ = conn.SetDeadline(deadline)
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
+	_ = conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	clientConn, channels, requests, err := ssh.NewClientConn(conn, address, &ssh.ClientConfig{
 		User:            cfg.User,
 		Auth:            auth,
@@ -148,7 +169,12 @@ func (m *Manager) Connect(ctx context.Context, cfg Config) (*ssh.Client, error) 
 
 	client := ssh.NewClient(clientConn, channels, requests)
 	m.mu.Lock()
-	m.clients[cfg.Alias] = client
+	if previous := m.clients[key]; previous != nil {
+		m.mu.Unlock()
+		_ = client.Close()
+		return previous, nil
+	}
+	m.clients[key] = client
 	m.mu.Unlock()
 	return client, nil
 }
@@ -223,7 +249,16 @@ func expandPath(path string) string {
 }
 
 func authMethods(identityFiles []string) ([]ssh.AuthMethod, error) {
+	methods, cleanup, err := authMethodsWithCleanup(identityFiles)
+	if cleanup != nil {
+		cleanup()
+	}
+	return methods, err
+}
+
+func authMethodsWithCleanup(identityFiles []string) ([]ssh.AuthMethod, func(), error) {
 	methods := make([]ssh.AuthMethod, 0, len(identityFiles)+1)
+	var closers []net.Conn
 	for _, identityFile := range identityFiles {
 		path := expandPath(strings.TrimSpace(identityFile))
 		if path == "" {
@@ -231,11 +266,13 @@ func authMethods(identityFiles []string) ([]ssh.AuthMethod, error) {
 		}
 		key, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read SSH identity %q: %w", path, err)
+			closeConnections(closers)
+			return nil, nil, fmt.Errorf("read SSH identity %q: %w", path, err)
 		}
 		signer, err := ssh.ParsePrivateKey(key)
 		if err != nil {
-			return nil, fmt.Errorf("parse SSH identity %q: %w", path, err)
+			closeConnections(closers)
+			return nil, nil, fmt.Errorf("parse SSH identity %q: %w", path, err)
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
@@ -243,12 +280,66 @@ func authMethods(identityFiles []string) ([]ssh.AuthMethod, error) {
 	if socket := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK")); socket != "" {
 		conn, err := net.Dial("unix", socket)
 		if err == nil {
+			closers = append(closers, conn)
 			agentClient := agent.NewClient(conn)
 			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
 		}
 	}
 	if len(methods) == 0 {
-		return nil, errors.New("no SSH identity or usable ssh-agent available")
+		closeConnections(closers)
+		return nil, nil, errors.New("no SSH identity or usable ssh-agent available")
 	}
-	return methods, nil
+	return methods, func() { closeConnections(closers) }, nil
+}
+
+func closeConnections(connections []net.Conn) {
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+}
+
+func connectionKey(cfg Config) (string, error) {
+	cfg.Timeout = 0
+	value, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("fingerprint SSH configuration: %w", err)
+	}
+	knownHosts, err := os.ReadFile(expandPath(cfg.KnownHostsFile))
+	if err != nil {
+		return "", fmt.Errorf("read known_hosts: %w", err)
+	}
+	hash := sha256.New()
+	_, _ = hash.Write(value)
+	_, _ = hash.Write(knownHosts)
+	_, _ = hash.Write([]byte(os.Getenv("SSH_AUTH_SOCK")))
+	for _, path := range cfg.IdentityFiles {
+		key, err := os.ReadFile(expandPath(path))
+		if err != nil {
+			return "", fmt.Errorf("read SSH identity %q: %w", path, err)
+		}
+		_, _ = hash.Write(key)
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func cfgTimeout(cfg Config) time.Duration {
+	if cfg.Timeout <= 0 {
+		return 10 * time.Second
+	}
+	return cfg.Timeout
+}
+
+func clientAlive(ctx context.Context, client *ssh.Client) (bool, error) {
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		return err == nil, nil
+	case <-ctx.Done():
+		_ = client.Close()
+		return false, ctx.Err()
+	}
 }

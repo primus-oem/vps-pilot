@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/primus-oem/vps-pilot/core/internal/application"
@@ -65,6 +66,12 @@ type applicationInput struct {
 	ID string `json:"id"`
 }
 
+type releasePlanInput struct {
+	ID          string   `json:"id"`
+	Environment string   `json:"environment"`
+	Services    []string `json:"services"`
+}
+
 type applicationGraphOutput struct {
 	Status string   `json:"status"`
 	ID     string   `json:"id"`
@@ -109,6 +116,12 @@ func Run(ctx context.Context, version string, store *state.Store) error {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input applicationInput) (*mcp.CallToolResult, applicationGraphOutput, error) {
 		return getApplicationGraph(ctx, req, input, store)
 	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "plan_application_release",
+		Description: "Builds an immutable, digest-bound release plan; it does not execute changes.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input releasePlanInput) (*mcp.CallToolResult, application.ReleasePlan, error) {
+		return createApplicationReleasePlan(ctx, req, input, store)
+	})
 	return server.Run(ctx, &mcp.StdioTransport{})
 }
 
@@ -128,8 +141,8 @@ func listHosts(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}, store *s
 	summaries := make([]hostSummary, 0, len(hosts))
 	for _, host := range hosts {
 		summaries = append(summaries, hostSummary{
-			ID: host.ID, Environment: host.Environment, SSHAlias: host.SSHAlias,
-			Host: host.Host, Port: host.Port, User: host.User,
+			ID: inventory.Sanitize([]byte(host.ID)), Environment: inventory.Sanitize([]byte(host.Environment)), SSHAlias: inventory.Sanitize([]byte(host.SSHAlias)),
+			Host: inventory.Sanitize([]byte(host.Host)), Port: host.Port, User: inventory.Sanitize([]byte(host.User)),
 			KnownHostsPinned: host.KnownHostsFile != "",
 		})
 	}
@@ -180,12 +193,17 @@ func getHostHealth(ctx context.Context, _ *mcp.CallToolRequest, input hostConnec
 	if err != nil {
 		return nil, hostHealthOutput{Status: "error", Alias: host.SSHAlias, Error: sanitizeSSHError(err.Error())}, nil
 	}
-	return nil, hostHealthOutput{Status: "ok", Alias: host.SSHAlias, Health: health}, nil
+	return nil, hostHealthOutput{Status: health.Status, Alias: host.SSHAlias, Health: health}, nil
 }
 
 func sanitizeSSHError(message string) string {
+	message = inventory.Sanitize([]byte(message))
 	if len(message) > 300 {
-		message = message[:300]
+		end := 300
+		for end > 0 && !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end]
 	}
 	return message
 }
@@ -216,4 +234,20 @@ func getApplicationGraph(ctx context.Context, _ *mcp.CallToolRequest, input appl
 		return nil, applicationGraphOutput{Status: "error", ID: input.ID, Error: err.Error()}, nil
 	}
 	return nil, applicationGraphOutput{Status: "ok", ID: app.ID, Digest: app.Digest, Order: order}, nil
+}
+
+func createApplicationReleasePlan(ctx context.Context, _ *mcp.CallToolRequest, input releasePlanInput, store *state.Store) (*mcp.CallToolResult, application.ReleasePlan, error) {
+	app, err := store.GetApplication(ctx, input.ID)
+	if err != nil {
+		return nil, application.ReleasePlan{}, err
+	}
+	var manifest application.Manifest
+	if err := json.Unmarshal([]byte(app.Manifest), &manifest); err != nil {
+		return nil, application.ReleasePlan{}, err
+	}
+	plan, err := application.CreateReleasePlan(&manifest, input.Environment, input.Services)
+	if err != nil {
+		return nil, application.ReleasePlan{}, err
+	}
+	return nil, plan, nil
 }
