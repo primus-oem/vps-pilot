@@ -162,6 +162,11 @@ func Validate(manifest *Manifest) error {
 			}
 		}
 	}
+	for name := range manifest.Policies {
+		if _, ok := manifest.Environments[name]; !ok {
+			return fmt.Errorf("policy %q must match an environment", name)
+		}
+	}
 	mappings := make(map[string]string)
 	for name, service := range manifest.Services {
 		if !serviceNamePattern.MatchString(name) {

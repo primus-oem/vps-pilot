@@ -16,6 +16,7 @@
   },
   "include": [
     "src/serverConfiguration.ts",
+    "src/inventoryView.ts",
     "tests/**/*.ts"
   ]
 }

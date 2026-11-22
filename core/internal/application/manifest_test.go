@@ -88,9 +88,54 @@ func TestReleasePlanBindsTargetsArtifactsAndConfig(t *testing.T) {
 	if !HasValidDigest(plan) {
 		t.Fatal("expected valid plan digest")
 	}
+	if plan.Risk.Level != "high" || !plan.Risk.ApprovalRequired {
+		t.Fatalf("expected stateful plan to require high-risk approval: %#v", plan.Risk)
+	}
 	plan.Targets[0].SSHAlias = "other"
 	if HasValidDigest(plan) {
 		t.Fatal("expected target change to invalidate digest")
+	}
+}
+
+func TestReleasePlanComparesAgainstPreviousPlan(t *testing.T) {
+	manifest, err := Parse([]byte(releaseFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, err := CreateReleasePlan(manifest, "staging", []string{"api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := manifest.Services["api"]
+	service.Image.Digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	manifest.Services["api"] = service
+	current, err := CreateReleasePlan(manifest, "staging", []string{"api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := CompareReleasePlans(previous, current)
+	if diff.Status != "changed" || len(diff.Changes) == 0 {
+		t.Fatalf("expected non-empty release diff, got %#v", diff)
+	}
+	foundImage := false
+	for _, change := range diff.Changes {
+		if change.Resource == "service:api" && change.Action == "updated" && strings.Contains(strings.Join(change.Fields, ","), "image") {
+			foundImage = true
+		}
+	}
+	if !foundImage {
+		t.Fatalf("expected image change in diff: %#v", diff.Changes)
+	}
+}
+
+func TestPolicyCanRequireHealthChecks(t *testing.T) {
+	manifest, err := Parse([]byte(releaseFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Policies = map[string]Policy{"staging": {RequireHealth: true}}
+	if _, err := CreateReleasePlan(manifest, "staging", []string{"api"}); err == nil {
+		t.Fatal("expected policy to reject missing health checks")
 	}
 }
 

@@ -13,7 +13,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 5
+
+var ErrReleasePlanNotFound = errors.New("release plan not found")
 
 type Host struct {
 	ID             string
@@ -33,6 +35,28 @@ type Application struct {
 	Digest    string
 	Manifest  string
 	CreatedAt string
+}
+
+type ReleasePlanSnapshot struct {
+	Digest         string
+	CoreDigest     string
+	ApplicationID  string
+	Environment    string
+	ManifestDigest string
+	PlanJSON       string
+	CreatedAt      string
+}
+
+type SecretBinding struct {
+	Application string
+	Environment string
+	Host        string
+	Service     string
+	Name        string
+	Reference   string
+	Version     string
+	Status      string
+	UpdatedAt   string
 }
 
 type Store struct {
@@ -243,6 +267,123 @@ func (s *Store) GetApplication(ctx context.Context, id string) (Application, err
 	return app, nil
 }
 
+func (s *Store) SaveReleasePlan(ctx context.Context, plan ReleasePlanSnapshot) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO release_plans (
+		plan_digest, core_digest, application_id, environment, manifest_digest, plan_json, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		plan.Digest, plan.CoreDigest, plan.ApplicationID, plan.Environment, plan.ManifestDigest, plan.PlanJSON)
+	if err != nil {
+		return fmt.Errorf("save immutable release plan: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetReleasePlan(ctx context.Context, digest string) (ReleasePlanSnapshot, error) {
+	var plan ReleasePlanSnapshot
+	err := s.db.QueryRowContext(ctx, `SELECT plan_digest, core_digest, application_id, environment,
+		manifest_digest, plan_json, created_at FROM release_plans WHERE plan_digest = ?`,
+		digest).Scan(&plan.Digest, &plan.CoreDigest, &plan.ApplicationID, &plan.Environment,
+		&plan.ManifestDigest, &plan.PlanJSON, &plan.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReleasePlanSnapshot{}, fmt.Errorf("release plan %q not found", digest)
+	}
+	if err != nil {
+		return ReleasePlanSnapshot{}, fmt.Errorf("get release plan: %w", err)
+	}
+	return plan, nil
+}
+
+func (s *Store) PreviousReleasePlan(ctx context.Context, applicationID, environment, coreDigest string) (ReleasePlanSnapshot, error) {
+	var plan ReleasePlanSnapshot
+	err := s.db.QueryRowContext(ctx, `SELECT plan_digest, core_digest, application_id, environment,
+		manifest_digest, plan_json, created_at FROM release_plans
+		WHERE application_id = ? AND environment = ? AND core_digest != ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+		applicationID, environment, coreDigest).Scan(&plan.Digest, &plan.CoreDigest, &plan.ApplicationID,
+		&plan.Environment, &plan.ManifestDigest, &plan.PlanJSON, &plan.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReleasePlanSnapshot{}, ErrReleasePlanNotFound
+	}
+	if err != nil {
+		return ReleasePlanSnapshot{}, fmt.Errorf("load latest release plan: %w", err)
+	}
+	return plan, nil
+}
+
+func (s *Store) UpsertSecretBinding(ctx context.Context, binding SecretBinding) error {
+	if binding.Application == "" || binding.Environment == "" || binding.Host == "" || binding.Service == "" ||
+		binding.Name == "" || binding.Reference == "" || binding.Version == "" ||
+		(binding.Status != "present" && binding.Status != "pending" && binding.Status != "revoked") {
+		return errors.New("secret binding metadata is incomplete")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO secret_bindings (
+		application_id, environment, host_alias, service_name, secret_name,
+		reference_digest, version, status, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(application_id, environment, host_alias, service_name, secret_name)
+	DO UPDATE SET reference_digest=excluded.reference_digest, version=excluded.version,
+		status=excluded.status, updated_at=CURRENT_TIMESTAMP`,
+		binding.Application, binding.Environment, binding.Host, binding.Service,
+		binding.Name, binding.Reference, binding.Version, binding.Status)
+	if err != nil {
+		return fmt.Errorf("save secret binding metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListSecretBindings(ctx context.Context, applicationID, environment string) ([]SecretBinding, error) {
+	query := `SELECT application_id, environment, host_alias, service_name, secret_name,
+		reference_digest, version, status, updated_at FROM secret_bindings`
+	args := []any{}
+	switch {
+	case applicationID != "" && environment != "":
+		query += ` WHERE application_id = ? AND environment = ?`
+		args = append(args, applicationID, environment)
+	case applicationID != "":
+		query += ` WHERE application_id = ?`
+		args = append(args, applicationID)
+	case environment != "":
+		query += ` WHERE environment = ?`
+		args = append(args, environment)
+	}
+	query += ` ORDER BY application_id, environment, host_alias, service_name, secret_name`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list secret binding metadata: %w", err)
+	}
+	defer rows.Close()
+	bindings := []SecretBinding{}
+	for rows.Next() {
+		var binding SecretBinding
+		if err := rows.Scan(&binding.Application, &binding.Environment, &binding.Host, &binding.Service,
+			&binding.Name, &binding.Reference, &binding.Version, &binding.Status, &binding.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan secret binding metadata: %w", err)
+		}
+		bindings = append(bindings, binding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate secret binding metadata: %w", err)
+	}
+	return bindings, nil
+}
+
+func (s *Store) RevokeSecretBinding(ctx context.Context, applicationID, environment, host, service, name string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE secret_bindings SET status = 'revoked', updated_at = CURRENT_TIMESTAMP
+		WHERE application_id = ? AND environment = ? AND host_alias = ? AND service_name = ? AND secret_name = ?`,
+		applicationID, environment, host, service, name)
+	if err != nil {
+		return fmt.Errorf("revoke secret binding metadata: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check secret binding revocation: %w", err)
+	}
+	if changed != 1 {
+		return errors.New("secret binding not found")
+	}
+	return nil
+}
+
 func migrate(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -321,6 +462,60 @@ func migrate(ctx context.Context, db *sql.DB) error {
 				created_at TEXT NOT NULL
 			)`,
 			`INSERT INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP)`,
+		)
+	}
+	if currentVersion < 4 {
+		statements = append(statements,
+			`CREATE TABLE release_plans (
+				plan_digest TEXT PRIMARY KEY,
+				core_digest TEXT NOT NULL,
+				application_id TEXT NOT NULL,
+				environment TEXT NOT NULL,
+				manifest_digest TEXT NOT NULL,
+				plan_json TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX release_plans_latest ON release_plans(application_id, environment, created_at)`,
+			`CREATE TABLE operation_journal (
+				event_id TEXT PRIMARY KEY,
+				correlation_id TEXT NOT NULL,
+				plan_digest TEXT NOT NULL,
+				actor TEXT NOT NULL,
+				resource_id TEXT NOT NULL,
+				event_type TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('ok', 'partial', 'denied', 'error')),
+				metadata_json TEXT NOT NULL,
+				occurred_at TEXT NOT NULL
+			)`,
+			`CREATE TRIGGER operation_journal_no_update BEFORE UPDATE ON operation_journal
+				BEGIN SELECT RAISE(ABORT, 'operation journal is append-only'); END`,
+			`CREATE TRIGGER operation_journal_no_delete BEFORE DELETE ON operation_journal
+				BEGIN SELECT RAISE(ABORT, 'operation journal is append-only'); END`,
+			`CREATE TABLE deployment_locks (
+				scope_id TEXT PRIMARY KEY,
+				holder_id TEXT NOT NULL,
+				plan_digest TEXT NOT NULL,
+				expires_at TEXT NOT NULL
+			)`,
+			`INSERT INTO schema_migrations(version, applied_at) VALUES (4, CURRENT_TIMESTAMP)`,
+		)
+	}
+	if currentVersion < 5 {
+		statements = append(statements,
+			`CREATE TABLE secret_bindings (
+				application_id TEXT NOT NULL,
+				environment TEXT NOT NULL,
+				host_alias TEXT NOT NULL,
+				service_name TEXT NOT NULL,
+				secret_name TEXT NOT NULL,
+				reference_digest TEXT NOT NULL,
+				version TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('present', 'pending', 'revoked')),
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (application_id, environment, host_alias, service_name, secret_name)
+			)`,
+			`CREATE INDEX secret_bindings_lookup ON secret_bindings(application_id, environment, status)`,
+			`INSERT INTO schema_migrations(version, applied_at) VALUES (5, CURRENT_TIMESTAMP)`,
 		)
 	}
 	for _, statement := range statements {

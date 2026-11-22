@@ -4,6 +4,7 @@
   "description": "Local MCP integration for VPS Pilot",
   "version": "0.1.0",
   "publisher": "Petru Reaboi",
+  "icon": "media/pilot-logo.png",
   "engines": {
     "vscode": "^1.110.0"
   },
@@ -12,9 +13,38 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
-    "onMcpServerDefinitionProvider:vps-pilot.mcp"
+    "onMcpServerDefinitionProvider:vps-pilot.mcp",
+    "onView:vpsPilot.inventory"
   ],
   "contributes": {
+    "commands": [
+      {
+        "command": "vpsPilot.refreshInventory",
+        "title": "VPS Pilot: Refresh Inventory"
+      },
+      {
+        "command": "vpsPilot.openDeploymentWorkflow",
+        "title": "VPS Pilot: Plan and Approve Deployment"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vpsPilot",
+          "title": "VPS Pilot",
+          "icon": "media/pilot-logo.png"
+        }
+      ]
+    },
+    "views": {
+      "vpsPilot": [
+        {
+          "id": "vpsPilot.inventory",
+          "name": "Inventory",
+          "icon": "media/pilot-logo.png"
+        }
+      ]
+    },
     "mcpServerDefinitionProviders": [
       {
         "id": "vps-pilot.mcp",

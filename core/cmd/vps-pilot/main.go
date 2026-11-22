@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/user"
 	"strings"
 	"time"
 
 	"github.com/primus-oem/vps-pilot/core/internal/application"
+	"github.com/primus-oem/vps-pilot/core/internal/approval"
+	"github.com/primus-oem/vps-pilot/core/internal/deployment"
 	"github.com/primus-oem/vps-pilot/core/internal/inventory"
 	"github.com/primus-oem/vps-pilot/core/internal/mcpserver"
+	"github.com/primus-oem/vps-pilot/core/internal/planning"
 	"github.com/primus-oem/vps-pilot/core/internal/state"
 	sshtransport "github.com/primus-oem/vps-pilot/core/internal/transport/ssh"
 )
@@ -21,12 +26,16 @@ var version = "0.1.0-dev"
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage: vps-pilot <mcp|host|app|version>")
+		fail("usage: vps-pilot <mcp|host|app|secret|version>")
 	}
 	ctx := context.Background()
 	switch os.Args[1] {
 	case "app":
 		if err := runAppCommand(ctx, os.Args[2:]); err != nil {
+			fail(err.Error())
+		}
+	case "secret":
+		if err := runSecretCommand(ctx, os.Args[2:]); err != nil {
 			fail(err.Error())
 		}
 	case "host":
@@ -52,6 +61,81 @@ func main() {
 func fail(message string) {
 	fmt.Fprintln(os.Stderr, message)
 	os.Exit(2)
+}
+
+func runSecretCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: vps-pilot secret <list|bind|rotate|revoke>")
+	}
+	store, err := state.OpenDefault(ctx)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("secret list", flag.ContinueOnError)
+		applicationID := fs.String("application", "", "application ID")
+		environment := fs.String("environment", "", "environment")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		bindings, err := store.ListSecretBindings(ctx, *applicationID, *environment)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		output := make([]map[string]string, 0, len(bindings))
+		for _, binding := range bindings {
+			output = append(output, map[string]string{
+				"application": binding.Application, "environment": binding.Environment,
+				"host": binding.Host, "service": binding.Service, "name": binding.Name,
+				"reference_digest": binding.Reference, "version": binding.Version, "status": binding.Status,
+			})
+		}
+		return encoder.Encode(output)
+	case "bind", "rotate":
+		fs := flag.NewFlagSet("secret "+args[0], flag.ContinueOnError)
+		applicationID := fs.String("application", "", "application ID")
+		environment := fs.String("environment", "", "environment")
+		host := fs.String("host", "", "SSH host alias")
+		service := fs.String("service", "", "Compose service name")
+		name := fs.String("name", "", "secret name")
+		reference := fs.String("reference", "", "opaque secret reference")
+		version := fs.String("version", "", "secret version")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *applicationID == "" || *environment == "" || *host == "" || *service == "" || *name == "" || *reference == "" {
+			return fmt.Errorf("secret %s requires -application -environment -host -service -name -reference", args[0])
+		}
+		if *version == "" {
+			*version = "v1"
+		}
+		referenceDigest := sha256.Sum256([]byte(*reference))
+		binding := state.SecretBinding{
+			Application: *applicationID, Environment: *environment, Host: *host,
+			Service: *service, Name: *name,
+			Reference: fmt.Sprintf("sha256:%x", referenceDigest), Version: *version, Status: "present",
+		}
+		if err := store.UpsertSecretBinding(ctx, binding); err != nil {
+			return err
+		}
+		fmt.Printf("secret binding recorded as metadata only: %s/%s %s=%s\n", *applicationID, *environment, *name, *version)
+		return nil
+	case "revoke":
+		if len(args) != 6 {
+			return fmt.Errorf("usage: vps-pilot secret revoke <application> <environment> <host> <service> <name>")
+		}
+		if err := store.RevokeSecretBinding(ctx, args[1], args[2], args[3], args[4], args[5]); err != nil {
+			return err
+		}
+		fmt.Println("secret binding revoked")
+		return nil
+	default:
+		return fmt.Errorf("unknown secret command %q", args[0])
+	}
 }
 
 func runHostCommand(ctx context.Context, args []string) error {
@@ -152,7 +236,7 @@ func runHostCommand(ctx context.Context, args []string) error {
 
 func runAppCommand(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vps-pilot app <validate|import|list|graph>")
+		return fmt.Errorf("usage: vps-pilot app <validate|import|list|graph|inventory|plan|preflight|approve|deploy>")
 	}
 	store, err := state.OpenDefault(ctx)
 	if err != nil {
@@ -161,20 +245,92 @@ func runAppCommand(ctx context.Context, args []string) error {
 	defer store.Close()
 
 	switch args[0] {
+	case "preflight", "deploy":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: vps-pilot app %s <plan-digest>", args[0])
+		}
+		actor, err := user.Current()
+		if err != nil {
+			return fmt.Errorf("resolve local operation actor: %w", err)
+		}
+		manager := sshtransport.NewManager()
+		defer manager.Close()
+		executor := deployment.NewExecutor(store, deployment.NewSSHRemote(manager))
+		if args[0] == "preflight" {
+			plan, err := executor.Preflight(ctx, args[1], actor.Username)
+			if err != nil {
+				return err
+			}
+			encoder := json.NewEncoder(os.Stdout)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(plan)
+		}
+		result, executeErr := executor.Execute(ctx, args[1], actor.Username)
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			return err
+		}
+		return executeErr
+	case "approve":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: vps-pilot app approve <plan-digest>")
+		}
+		info, err := os.Stdin.Stat()
+		if err != nil {
+			return fmt.Errorf("inspect approval input: %w", err)
+		}
+		if info.Mode()&os.ModeCharDevice == 0 {
+			return fmt.Errorf("approval requires a trusted interactive terminal")
+		}
+		snapshot, err := store.GetReleasePlan(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		var plan application.ReleasePlan
+		if err := json.Unmarshal([]byte(snapshot.PlanJSON), &plan); err != nil {
+			return fmt.Errorf("decode stored release plan: %w", err)
+		}
+		if plan.Digest != args[1] || !application.HasValidDigest(plan) {
+			return fmt.Errorf("stored release plan failed integrity validation")
+		}
+		preview, err := json.MarshalIndent(struct {
+			Application string                         `json:"application"`
+			Environment string                         `json:"environment"`
+			Digest      string                         `json:"digest"`
+			Selected    []string                       `json:"selected_services"`
+			Targets     []application.ReleaseTarget    `json:"targets"`
+			Services    []application.ReleaseService   `json:"services"`
+			Preflight   []application.ComposePreflight `json:"preflight"`
+			Risk        application.RiskSummary        `json:"risk"`
+			Diff        application.ReleaseDiff        `json:"diff"`
+		}{plan.Application, plan.Environment, plan.Digest, plan.Selected, plan.Targets, plan.Services, plan.Preflight, plan.Risk, plan.Diff}, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, string(preview))
+		shortDigest := strings.TrimPrefix(plan.Digest, "sha256:")[:12]
+		fmt.Fprintf(os.Stderr, "Type APPROVE %s to authorize this exact plan: ", shortDigest)
+		confirmation, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read approval confirmation: %w", err)
+		}
+		if strings.TrimSpace(confirmation) != "APPROVE "+shortDigest {
+			return fmt.Errorf("approval confirmation did not match")
+		}
+		actor, err := user.Current()
+		if err != nil {
+			return fmt.Errorf("resolve local approval actor: %w", err)
+		}
+		if err := approval.ApprovePlan(ctx, store, plan.Digest, actor.Username); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stdout, "plan approved locally; approval expires in 5 minutes")
+		return nil
 	case "plan":
 		if len(args) != 4 {
 			return fmt.Errorf("usage: vps-pilot app plan <application-id> <environment> <service,service>")
 		}
-		app, err := store.GetApplication(ctx, args[1])
-		if err != nil {
-			return err
-		}
-		var manifest application.Manifest
-		if err := json.Unmarshal([]byte(app.Manifest), &manifest); err != nil {
-			return err
-		}
 		services := strings.Split(args[3], ",")
-		plan, err := application.CreateReleasePlan(&manifest, args[2], services)
+		plan, err := planning.New(store).Create(ctx, args[1], args[2], services)
 		if err != nil {
 			return err
 		}
@@ -252,6 +408,25 @@ func runAppCommand(ctx context.Context, args []string) error {
 			fmt.Printf("%s\t%s\t%s/%s\n", name, service.Role, service.Deploy.Project, service.Deploy.Service)
 		}
 		return nil
+	case "inventory":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: vps-pilot app inventory <application-id>")
+		}
+		app, err := store.GetApplication(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		var manifest application.Manifest
+		if err := json.Unmarshal([]byte(app.Manifest), &manifest); err != nil {
+			return err
+		}
+		inventory, err := application.BuildInventory(&manifest, app.Digest)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(inventory)
 	default:
 		return fmt.Errorf("unknown app command %q", args[0])
 	}
