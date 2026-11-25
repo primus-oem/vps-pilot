@@ -122,6 +122,15 @@ type deploymentOutput struct {
 	Error         string   `json:"error,omitempty"`
 }
 
+type reconcileOutput struct {
+	Status        string   `json:"status"`
+	PlanDigest    string   `json:"plan_digest"`
+	CorrelationID string   `json:"correlation_id"`
+	Observed      []string `json:"observed_services"`
+	Divergences   []string `json:"divergences"`
+	Error         string   `json:"error,omitempty"`
+}
+
 type applicationGraphOutput struct {
 	Status string   `json:"status"`
 	ID     string   `json:"id"`
@@ -195,6 +204,12 @@ func Run(ctx context.Context, version string, store *state.Store) error {
 		Description: "Executes only a locally approved, digest-bound stateless Compose plan after remote revalidation.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input releaseDigestInput) (*mcp.CallToolResult, deploymentOutput, error) {
 		return executeApprovedPlan(ctx, req, input, store)
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "reconcile_application_release",
+		Description: "Performs read-only reconciliation against an immutable release plan.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input releaseDigestInput) (*mcp.CallToolResult, reconcileOutput, error) {
+		return reconcileApplicationRelease(ctx, req, input, store)
 	})
 	return server.Run(ctx, &mcp.StdioTransport{})
 }
@@ -382,6 +397,26 @@ func executeApprovedPlan(ctx context.Context, _ *mcp.CallToolRequest, input rele
 		Attempted: result.Attempted, Applied: result.Applied,
 	}
 	if err != nil {
+		output.Error = sanitizeSSHError(err.Error())
+	}
+	return nil, output, nil
+}
+
+func reconcileApplicationRelease(ctx context.Context, _ *mcp.CallToolRequest, input releaseDigestInput, store *state.Store) (*mcp.CallToolResult, reconcileOutput, error) {
+	actor, err := user.Current()
+	if err != nil {
+		return nil, reconcileOutput{Status: "error", Error: "resolve local operation actor"}, nil
+	}
+	manager := sshtransport.NewManager()
+	defer manager.Close()
+	executor := deployment.NewExecutor(store, deployment.NewSSHRemote(manager))
+	result, err := executor.Reconcile(ctx, input.Digest, actor.Username)
+	output := reconcileOutput{
+		Status: result.Status, PlanDigest: result.PlanDigest, CorrelationID: result.CorrelationID,
+		Observed: result.Observed, Divergences: result.Divergences,
+	}
+	if err != nil {
+		output.Status = "error"
 		output.Error = sanitizeSSHError(err.Error())
 	}
 	return nil, output, nil

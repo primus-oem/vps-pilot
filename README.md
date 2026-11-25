@@ -26,8 +26,11 @@ The repository contains an early development implementation:
 - `app approve` records a five-minute, terminal-confirmed approval bound to the exact preflighted plan and target identity. Execution revalidates the target, policy, Compose configuration and health.
 - Execution currently denies stateful/managed services, secrets, environment values, host bind mounts, published ports and elevated container capabilities. It is not a complete deployment or secret-management workflow.
 - The VS Code extension registers the configured local executable as an MCP server.
-- The VS Code Explorer includes a VPS Pilot inventory view and a deployment workflow command.
+- The VS Code Activity Bar includes a VPS Pilot inventory view and a deployment workflow command.
 - Secret bindings and rotation metadata are stored in local SQLite; MCP output and CLI records do not contain secret values or raw references.
+- A local webview provides typed deployment preview and application refresh.
+- The core exposes reconcile tooling and reports Compose/runtime divergence without mutating hosts.
+- Secret provisioning has an SSH/SFTP broker foundation with hidden terminal intake, restricted paths and metadata-only receipts.
 - A local Docker Compose smoke test was executed successfully against PostgreSQL 17 on the Docker Desktop daemon.
 
 The deployment executor and MCP/CLI entry points have automated fake-remote coverage, but have not been validated against a disposable VPS. VS Code plan/approval/progress UI, secret intake, stateful deployment, reconciliation and recovery remain incomplete. The journal and leases are local SQLite controls, not distributed coordination. Do not use this version to manage production infrastructure.

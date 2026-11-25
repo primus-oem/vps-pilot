@@ -17,6 +17,7 @@
   "include": [
     "src/serverConfiguration.ts",
     "src/inventoryView.ts",
+    "src/deploymentView.ts",
     "tests/**/*.ts"
   ]
 }

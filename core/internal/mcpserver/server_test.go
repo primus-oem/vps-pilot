@@ -48,7 +48,7 @@ func TestStdioServerExposesDeploymentToolsWithoutExecutingUnknownPlans(t *testin
 	}
 	defer session.Close()
 
-	for _, name := range []string{"preflight_application_release", "execute_approved_plan"} {
+	for _, name := range []string{"preflight_application_release", "execute_approved_plan", "reconcile_application_release"} {
 		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: map[string]any{"digest": "unknown"}})
 		if err != nil {
 			t.Fatal(err)

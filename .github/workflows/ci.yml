@@ -18,10 +18,27 @@ jobs:
           cache-dependency-path: core/go.sum
       - run: go test -p=1 ./...
         working-directory: core
+      - run: go test -race -p=1 ./...
+        working-directory: core
       - run: go vet ./...
         working-directory: core
-      - run: go build ./cmd/vps-pilot
+      - name: Build cross-platform binaries
         working-directory: core
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -o dist/vps-pilot-linux-amd64 ./cmd/vps-pilot
+          GOOS=linux GOARCH=arm64 go build -o dist/vps-pilot-linux-arm64 ./cmd/vps-pilot
+          GOOS=darwin GOARCH=amd64 go build -o dist/vps-pilot-darwin-amd64 ./cmd/vps-pilot
+          GOOS=darwin GOARCH=arm64 go build -o dist/vps-pilot-darwin-arm64 ./cmd/vps-pilot
+          GOOS=windows GOARCH=amd64 go build -o dist/vps-pilot-windows-amd64.exe ./cmd/vps-pilot
+
+  docker-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run disposable Compose smoke and failure gates
+        run: |
+          bash test/docker-compose-integration.sh
 
   extension:
     runs-on: ubuntu-latest
@@ -34,9 +51,11 @@ jobs:
           cache-dependency-path: extension/package-lock.json
       - run: npm ci
         working-directory: extension
-      - run: npm audit
+      - run: npm audit --omit=dev
         working-directory: extension
       - run: npm test
         working-directory: extension
       - run: npm run compile
+        working-directory: extension
+      - run: npx @vscode/vsce package
         working-directory: extension

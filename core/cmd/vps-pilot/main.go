@@ -18,8 +18,10 @@ import (
 	"github.com/primus-oem/vps-pilot/core/internal/inventory"
 	"github.com/primus-oem/vps-pilot/core/internal/mcpserver"
 	"github.com/primus-oem/vps-pilot/core/internal/planning"
+	"github.com/primus-oem/vps-pilot/core/internal/secrets"
 	"github.com/primus-oem/vps-pilot/core/internal/state"
 	sshtransport "github.com/primus-oem/vps-pilot/core/internal/transport/ssh"
+	"golang.org/x/term"
 )
 
 var version = "0.1.0-dev"
@@ -102,22 +104,51 @@ func runSecretCommand(ctx context.Context, args []string) error {
 		host := fs.String("host", "", "SSH host alias")
 		service := fs.String("service", "", "Compose service name")
 		name := fs.String("name", "", "secret name")
-		reference := fs.String("reference", "", "opaque secret reference")
 		version := fs.String("version", "", "secret version")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if *applicationID == "" || *environment == "" || *host == "" || *service == "" || *name == "" || *reference == "" {
-			return fmt.Errorf("secret %s requires -application -environment -host -service -name -reference", args[0])
+		if *applicationID == "" || *environment == "" || *host == "" || *service == "" || *name == "" {
+			return fmt.Errorf("secret %s requires -application -environment -host -service -name", args[0])
 		}
 		if *version == "" {
 			*version = "v1"
 		}
-		referenceDigest := sha256.Sum256([]byte(*reference))
+		info, err := os.Stdin.Stat()
+		if err != nil {
+			return fmt.Errorf("inspect secret intake terminal: %w", err)
+		}
+		if info.Mode()&os.ModeCharDevice == 0 {
+			return fmt.Errorf("secret intake requires a trusted interactive terminal")
+		}
+		fmt.Fprintf(os.Stderr, "Enter secret %s (input is hidden): ", *name)
+		value, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return fmt.Errorf("read secret value: %w", err)
+		}
+		if len(value) == 0 {
+			clear(value)
+			return fmt.Errorf("secret value is required")
+		}
+		configuredHost, err := store.GetHost(ctx, *host)
+		if err != nil {
+			clear(value)
+			return err
+		}
+		manager := sshtransport.NewManager()
+		defer manager.Close()
+		receipt, err := secrets.NewSSHBroker(manager).Provision(ctx, configuredHost, secrets.ProvisionRequest{
+			Project: *applicationID, Environment: *environment, Service: *service,
+			Name: *name, Version: *version,
+		}, value)
+		if err != nil {
+			return err
+		}
 		binding := state.SecretBinding{
 			Application: *applicationID, Environment: *environment, Host: *host,
 			Service: *service, Name: *name,
-			Reference: fmt.Sprintf("sha256:%x", referenceDigest), Version: *version, Status: "present",
+			Reference: receipt.Digest, Version: *version, Status: "present",
 		}
 		if err := store.UpsertSecretBinding(ctx, binding); err != nil {
 			return err
@@ -236,7 +267,7 @@ func runHostCommand(ctx context.Context, args []string) error {
 
 func runAppCommand(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vps-pilot app <validate|import|list|graph|inventory|plan|preflight|approve|deploy>")
+		return fmt.Errorf("usage: vps-pilot app <validate|import|list|graph|inventory|plan|preflight|approve|deploy|reconcile>")
 	}
 	store, err := state.OpenDefault(ctx)
 	if err != nil {
@@ -245,6 +276,22 @@ func runAppCommand(ctx context.Context, args []string) error {
 	defer store.Close()
 
 	switch args[0] {
+	case "reconcile":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: vps-pilot app reconcile <plan-digest>")
+		}
+		actor, err := user.Current()
+		if err != nil {
+			return fmt.Errorf("resolve local operation actor: %w", err)
+		}
+		manager := sshtransport.NewManager()
+		defer manager.Close()
+		executor := deployment.NewExecutor(store, deployment.NewSSHRemote(manager))
+		result, reconcileErr := executor.Reconcile(ctx, args[1], actor.Username)
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			return err
+		}
+		return reconcileErr
 	case "preflight", "deploy":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: vps-pilot app %s <plan-digest>", args[0])

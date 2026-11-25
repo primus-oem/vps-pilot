@@ -32,6 +32,14 @@ type DeploymentResult struct {
 	Applied       []string `json:"applied_services"`
 }
 
+type ReconcileResult struct {
+	Status        string   `json:"status"`
+	PlanDigest    string   `json:"plan_digest"`
+	CorrelationID string   `json:"correlation_id"`
+	Observed      []string `json:"observed_services"`
+	Divergences   []string `json:"divergences"`
+}
+
 type deploymentLock struct {
 	scope string
 }
@@ -203,6 +211,52 @@ func (e *Executor) Execute(ctx context.Context, digest, actor string) (result De
 	}
 	result.Status = "ok"
 	if err = e.recordWithCorrelation(ctx, plan, actor, correlationID, "deployment.execution.completed", "ok", "{}"); err != nil {
+		result.Status = "partial"
+		return result, err
+	}
+	return result, nil
+}
+
+func (e *Executor) Reconcile(ctx context.Context, digest, actor string) (ReconcileResult, error) {
+	plan, _, err := e.loadPlan(ctx, digest)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	correlationID, err := newID()
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	result := ReconcileResult{
+		Status: "ok", PlanDigest: plan.Digest, CorrelationID: correlationID,
+		Observed: []string{}, Divergences: []string{},
+	}
+	if err := e.recordWithCorrelation(ctx, plan, actor, correlationID, "deployment.reconcile.started", "ok", "{}"); err != nil {
+		return result, err
+	}
+	current, err := e.inspectPlan(ctx, plan, nil)
+	if err != nil {
+		result.Status = "error"
+		_ = e.recordWithCorrelation(ctx, plan, actor, correlationID, "deployment.reconcile.failed", "error", "{}")
+		return result, err
+	}
+	if !reflect.DeepEqual(sortedEvidence(plan.Preflight), sortedEvidence(current)) {
+		result.Status = "divergent"
+		result.Divergences = append(result.Divergences, "compose_config_or_runtime_changed")
+	}
+	selected := make(map[string]bool, len(plan.Selected))
+	for _, name := range plan.Selected {
+		selected[name] = true
+	}
+	for _, service := range plan.Services {
+		if selected[service.Name] {
+			result.Observed = append(result.Observed, service.Name)
+		}
+	}
+	status := "ok"
+	if result.Status != "ok" {
+		status = "partial"
+	}
+	if err := e.recordWithCorrelation(ctx, plan, actor, correlationID, "deployment.reconcile.completed", status, "{}"); err != nil {
 		result.Status = "partial"
 		return result, err
 	}

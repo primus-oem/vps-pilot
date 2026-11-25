@@ -187,6 +187,42 @@ func TestPreflightRejectsUnclassifiedEnvironmentValues(t *testing.T) {
 	}
 }
 
+func TestExecutionPartialFailureIsReportedAndJournaled(t *testing.T) {
+	ctx := context.Background()
+	store, remote, executor, plan := setupExecutor(t, safeComposeConfig)
+	preflighted, err := executor.Preflight(ctx, plan.Digest, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := approval.ApprovePlan(ctx, store, preflighted.Digest, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	remote.upError = errors.New("injected Compose failure")
+	result, err := executor.Execute(ctx, preflighted.Digest, "operator")
+	if err == nil {
+		t.Fatal("expected injected Compose failure")
+	}
+	if result.Status != "partial" || len(result.Attempted) != 1 {
+		t.Fatalf("unexpected partial-failure result: %#v", result)
+	}
+}
+
+func TestReconcileReportsRuntimeDivergence(t *testing.T) {
+	ctx := context.Background()
+	_, _, executor, plan := setupExecutor(t, safeComposeConfig)
+	preflighted, err := executor.Preflight(ctx, plan.Digest, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Reconcile(ctx, preflighted.Digest, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "ok" || len(result.Observed) != 1 {
+		t.Fatalf("unexpected reconcile result: %#v", result)
+	}
+}
+
 func setupExecutor(t *testing.T, composeConfig string) (*state.Store, *fakeRemote, *Executor, application.ReleasePlan) {
 	t.Helper()
 	ctx := context.Background()

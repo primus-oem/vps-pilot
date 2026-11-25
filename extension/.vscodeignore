@@ -1,0 +1,6 @@
+.test-out/**
+src/**
+tests/**
+tsconfig*.json
+.gitignore
+node_modules/**

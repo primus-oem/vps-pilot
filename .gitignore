@@ -10,3 +10,5 @@
 /extension/out/
 /extension/.test-out/
 /extension/*.vsix
+/core/dist/
+/extension/SHA256SUMS.txt
