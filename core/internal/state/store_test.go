@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -96,6 +97,95 @@ func TestApplicationPersistence(t *testing.T) {
 	}
 	if len(apps) != 1 || apps[0].Name != "sample" {
 		t.Fatalf("unexpected applications: %#v", apps)
+	}
+}
+
+func TestSecretBindingRotationPreservesVersionHistory(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "private", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	binding := SecretBinding{
+		Application: "sample", Environment: "staging", Host: "staging-1",
+		Service: "api", Name: "API_TOKEN", Reference: "sha256:first", Version: "v1", Status: "present",
+	}
+	if err := store.UpsertSecretBinding(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	binding.Reference = "sha256:second"
+	binding.Version = "v2"
+	if err := store.UpsertSecretBinding(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.GetSecretBinding(ctx, "sample", "staging", "staging-1", "api", "API_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Version != "v2" {
+		t.Fatalf("expected v2 current, got %q", current.Version)
+	}
+	all, err := store.ListSecretBindings(ctx, "sample", "staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].Status != "superseded" || all[1].Status != "present" {
+		t.Fatalf("unexpected binding history: %#v", all)
+	}
+	if err := store.RevokeSecretBinding(ctx, "sample", "staging", "staging-1", "api", "API_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetSecretBinding(ctx, "sample", "staging", "staging-1", "api", "API_TOKEN"); err == nil {
+		t.Fatal("revoked binding must not be current")
+	}
+}
+
+func TestMigrationFromVersionFivePreservesSecretBindings(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "private", "state.db")
+	if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+		INSERT INTO schema_migrations(version, applied_at) VALUES (5, CURRENT_TIMESTAMP);
+		CREATE TABLE secret_bindings (
+			application_id TEXT NOT NULL, environment TEXT NOT NULL, host_alias TEXT NOT NULL,
+			service_name TEXT NOT NULL, secret_name TEXT NOT NULL, reference_digest TEXT NOT NULL,
+			version TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('present', 'pending', 'revoked')),
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (application_id, environment, host_alias, service_name, secret_name)
+		);
+		INSERT INTO secret_bindings VALUES (
+			'sample', 'staging', 'staging-1', 'api', 'API_TOKEN',
+			'sha256:legacy', 'v1', 'present', CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	bindings, err := store.ListSecretBindings(ctx, "sample", "staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 1 || bindings[0].Version != "v1" ||
+		bindings[0].Reference != "sha256:legacy" || bindings[0].Status != "present" {
+		t.Fatalf("migration did not preserve the existing binding: %#v", bindings)
 	}
 }
 

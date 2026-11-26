@@ -8,6 +8,8 @@ import (
 	"errors"
 	"os"
 	"path"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +31,13 @@ type ProvisionRequest struct {
 	Version     string
 }
 
+func (r ProvisionRequest) TargetPath() (string, error) {
+	if err := r.validate(); err != nil {
+		return "", err
+	}
+	return path.Join("/srv/vps-pilot/secrets", r.Project, r.Environment, r.Service, r.Name+"."+r.Version), nil
+}
+
 type ProvisionReceipt struct {
 	TargetPath string `json:"target_path"`
 	OwnerMode  string `json:"owner_mode"`
@@ -40,11 +49,15 @@ type SSHBroker struct {
 	manager *sshtransport.Manager
 }
 
+var scopeSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+var versionSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
+
 func NewSSHBroker(manager *sshtransport.Manager) *SSHBroker {
 	return &SSHBroker{manager: manager}
 }
 
 func (b *SSHBroker) Provision(ctx context.Context, host state.Host, request ProvisionRequest, value []byte) (receipt ProvisionReceipt, err error) {
+	defer clear(value)
 	if b == nil || b.manager == nil {
 		return receipt, errors.New("secret broker is not configured")
 	}
@@ -52,7 +65,6 @@ func (b *SSHBroker) Provision(ctx context.Context, host state.Host, request Prov
 		return receipt, err
 	}
 	if len(value) == 0 || len(value) > 1024*1024 {
-		clear(value)
 		return receipt, errors.New("secret value must contain 1 MiB or less")
 	}
 	timeout := contextTimeout(host)
@@ -64,34 +76,32 @@ func (b *SSHBroker) Provision(ctx context.Context, host state.Host, request Prov
 		Timeout: timeout,
 	})
 	if err != nil || client == nil {
-		clear(value)
 		return receipt, errors.New("strict SSH connection for secret provisioning failed")
 	}
 	sftpClient, err := sftp.NewClient(client)
 	if err != nil {
-		clear(value)
 		return receipt, errors.New("open SFTP session for secret provisioning failed")
 	}
 	defer sftpClient.Close()
 
-	root := path.Join("/srv/vps-pilot/secrets", request.Project, request.Environment)
-	if err := ensureDirectory(sftpClient, root, 0700); err != nil {
-		clear(value)
+	target, err := request.TargetPath()
+	if err != nil {
+		return receipt, err
+	}
+	root := path.Dir(target)
+	if err := ensurePrivateDirectoryTree(sftpClient, root); err != nil {
 		return receipt, err
 	}
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
-		clear(value)
 		clear(random)
 		return receipt, errors.New("generate secret staging name failed")
 	}
 	suffix := hex.EncodeToString(random)
 	clear(random)
-	target := path.Join(root, request.Name+"."+request.Version)
 	temp := path.Join(root, ".secret-"+suffix)
 	file, err := sftpClient.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
-		clear(value)
 		return receipt, errors.New("create secret staging file failed")
 	}
 	var closeOnce sync.Once
@@ -103,12 +113,10 @@ func (b *SSHBroker) Provision(ctx context.Context, host state.Host, request Prov
 	if err := file.Chmod(0600); err != nil {
 		_ = closeFile()
 		_ = sftpClient.Remove(temp)
-		clear(value)
 		return receipt, errors.New("restrict secret staging file permissions failed")
 	}
 	written, err := file.Write(value)
 	expected := len(value)
-	clear(value)
 	if err == nil && written != expected {
 		err = errors.New("incomplete secret write")
 	}
@@ -119,18 +127,26 @@ func (b *SSHBroker) Provision(ctx context.Context, host state.Host, request Prov
 		_ = sftpClient.Remove(temp)
 		return receipt, errors.New("write secret staging file failed")
 	}
+	if _, err := sftpClient.Lstat(target); err == nil {
+		_ = sftpClient.Remove(temp)
+		return receipt, errors.New("secret version already exists")
+	} else if !os.IsNotExist(err) {
+		_ = sftpClient.Remove(temp)
+		return receipt, errors.New("inspect existing secret version failed")
+	}
 	if err := sftpClient.Rename(temp, target); err != nil {
 		_ = sftpClient.Remove(temp)
 		return receipt, errors.New("activate secret file failed")
 	}
-	if _, err := sftpClient.Lstat(target); err != nil {
+	info, err := sftpClient.Lstat(target)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
 		return receipt, errors.New("verify secret target failed")
 	}
 	return ProvisionReceipt{
 		TargetPath: target,
 		OwnerMode:  "0600",
 		Version:    request.Version,
-		Digest:     "sha256:" + hex.EncodeToString(secretDigest([]byte(target))),
+		Digest:     "sha256:" + hex.EncodeToString(pathDigest([]byte(target))),
 	}, nil
 }
 
@@ -153,6 +169,10 @@ func (b *SSHBroker) Revoke(ctx context.Context, host state.Host, receipt Provisi
 		return errors.New("open SFTP session for secret revocation failed")
 	}
 	defer sftpClient.Close()
+	info, err := sftpClient.Lstat(receipt.TargetPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("secret revoke target is not a regular file")
+	}
 	if err := sftpClient.Remove(receipt.TargetPath); err != nil {
 		return errors.New("remove secret file failed")
 	}
@@ -160,42 +180,65 @@ func (b *SSHBroker) Revoke(ctx context.Context, host state.Host, receipt Provisi
 }
 
 func (r ProvisionRequest) validate() error {
-	for _, value := range []string{r.Project, r.Environment, r.Service, r.Name, r.Version} {
-		if value == "" || len(value) > 128 || path.Base(value) != value ||
-			value != path.Clean(value) {
+	for _, value := range []string{r.Project, r.Environment, r.Service, r.Name} {
+		if !scopeSegmentPattern.MatchString(value) {
 			return errors.New("invalid secret provisioning scope")
 		}
+	}
+	if !versionSegmentPattern.MatchString(r.Version) {
+		return errors.New("invalid secret version")
 	}
 	return nil
 }
 
-func ensureDirectory(client *sftp.Client, dir string, mode os.FileMode) error {
-	info, err := client.Stat(dir)
-	if err == nil {
-		if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-			return errors.New("secret directory is missing or has unsafe permissions")
+func ensurePrivateDirectoryTree(client *sftp.Client, target string) error {
+	current := "/"
+	for _, segment := range strings.Split(strings.TrimPrefix(target, "/"), "/") {
+		current = path.Join(current, segment)
+		info, err := client.Lstat(current)
+		if os.IsNotExist(err) {
+			if err := client.Mkdir(current); err != nil {
+				return errors.New("create secret directory failed")
+			}
+			if err := client.Chmod(current, 0700); err != nil {
+				return errors.New("restrict secret directory permissions failed")
+			}
+			info, err = client.Lstat(current)
 		}
-		return nil
-	}
-	if err := client.MkdirAll(dir); err != nil {
-		return errors.New("create secret directory failed")
-	}
-	if err := client.Chmod(dir, mode); err != nil {
-		return errors.New("restrict secret directory permissions failed")
-	}
-	info, err = client.Stat(dir)
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return errors.New("secret directory permissions could not be verified")
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("secret directory contains an invalid path component")
+		}
+		if current == "/srv/vps-pilot" || strings.HasPrefix(current, "/srv/vps-pilot/") {
+			if info.Mode().Perm()&0077 != 0 {
+				return errors.New("secret directory permissions are too broad")
+			}
+		}
 	}
 	return nil
 }
 
 func safeSecretPath(value string) bool {
-	return path.Clean(value) == value && len(value) >= len("/srv/vps-pilot/secrets/") &&
-		value[:len("/srv/vps-pilot/secrets/")] == "/srv/vps-pilot/secrets/"
+	if path.Clean(value) != value {
+		return false
+	}
+	segments := strings.Split(strings.TrimPrefix(value, "/"), "/")
+	if len(segments) != 7 || segments[0] != "srv" || segments[1] != "vps-pilot" || segments[2] != "secrets" {
+		return false
+	}
+	for _, segment := range segments[3:6] {
+		if !scopeSegmentPattern.MatchString(segment) {
+			return false
+		}
+	}
+	separator := strings.IndexByte(segments[6], '.')
+	if separator <= 0 || separator == len(segments[6])-1 {
+		return false
+	}
+	return scopeSegmentPattern.MatchString(segments[6][:separator]) &&
+		versionSegmentPattern.MatchString(segments[6][separator+1:])
 }
 
-func secretDigest(value []byte) []byte {
+func pathDigest(value []byte) []byte {
 	sum := sha256.Sum256(value)
 	return sum[:]
 }
